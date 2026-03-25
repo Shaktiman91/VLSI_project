@@ -1,4 +1,3 @@
-
 ##########################################################################
 ###
 ### Master synthesis script, including settings.
@@ -25,8 +24,8 @@ source scripts/synth_set.tcl
 
 #suspend
 
-# Elaboration
-source scripts/synth_elb.tcl
+# Elaboration (with clock gating enabled)
+source scripts/synth_elbcg.tcl
 
 #suspend
 
