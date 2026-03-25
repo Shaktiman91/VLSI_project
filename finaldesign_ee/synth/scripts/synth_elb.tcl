@@ -1,4 +1,3 @@
-
 ##########################################################################
 ###
 ### Synthesis scripts - elaboration.
@@ -28,7 +27,7 @@ puts ""
 # Source design HDL
 read_hdl -v2001 "${INPUT_PATH}/design/${DESIGN}.v"
 read_hdl -v2001 "${INPUT_PATH}/design/accelerator.v"
-read_hdl -sv    "${INPUT_PATH}/design/accelerator_fft.v"
+read_hdl -sv    "${INPUT_PATH}/design/accelerator_fft_pipelined.v"
 read_hdl -v2001 "${INPUT_PATH}/design/accelerator_mem.v"
 read_hdl -v2001 "${INPUT_PATH}/design/picosoc.v"
 read_hdl -v2001 "${INPUT_PATH}/design/spimemio.v"
