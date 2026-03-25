@@ -11,6 +11,12 @@
  *   - Shorter active time => less total energy (race-to-sleep principle).
  *   - All other logic (interface, memory map, loop control) is identical to
  *     the baseline, making it a drop-in replacement.
+ *
+ * Key implementation note:
+ *   accel_mem_rdata is `input wire [31:0]` (unsigned). In Verilog, any
+ *   expression containing an unsigned operand is evaluated as unsigned,
+ *   which would corrupt the fixed-point multiply and the >>> shift.
+ *   The fix is to cast it with $signed() wherever it appears in arithmetic.
  */
 
 module accelerator_fft_pipelined #(
@@ -145,21 +151,22 @@ module accelerator_fft_pipelined #(
           fft_finished <= '0;
         end
 
-        READ_W_M_RE: w_m_re <= accel_mem_rdata;
-        READ_W_M_IM: w_m_im <= accel_mem_rdata;
+        READ_W_M_RE: w_m_re <= $signed(accel_mem_rdata);
+        READ_W_M_IM: w_m_im <= $signed(accel_mem_rdata);
 
-        BUTTERFLY_READ_1_RE: u_re <= accel_mem_rdata;
-        BUTTERFLY_READ_1_IM: u_im <= accel_mem_rdata;
-        BUTTERFLY_READ_2_RE: v_re <= accel_mem_rdata;
+        BUTTERFLY_READ_1_RE: u_re <= $signed(accel_mem_rdata);
+        BUTTERFLY_READ_1_IM: u_im <= $signed(accel_mem_rdata);
+        BUTTERFLY_READ_2_RE: v_re <= $signed(accel_mem_rdata);
 
         // KEY OPTIMIZATION: pre-compute t = w * v and latch it.
-        // w_re/w_im are NOT updated here - they are still the correct
-        // twiddle for this butterfly. w update stays in BUTTERFLY_COMPUTE.
+        // IMPORTANT: accel_mem_rdata is `input wire [31:0]` (unsigned).
+        // We must cast it with $signed() so that the multiply and >>>
+        // are evaluated as signed arithmetic -- matching the baseline which
+        // uses the signed register v_im instead.
         BUTTERFLY_READ_2_IM: begin
-          v_im      <= accel_mem_rdata;
-          // Use current (unmodified) w_re/w_im with v_re and incoming v_im
-          t_re_pipe <= (v_re * w_re - accel_mem_rdata * w_im) >>> SCALE;
-          t_im_pipe <= (v_re * w_im + accel_mem_rdata * w_re) >>> SCALE;
+          v_im      <= $signed(accel_mem_rdata);
+          t_re_pipe <= (v_re * w_re - $signed(accel_mem_rdata) * w_im) >>> SCALE;
+          t_im_pipe <= (v_re * w_im + $signed(accel_mem_rdata) * w_re) >>> SCALE;
         end
 
         // BUTTERFLY_COMPUTE: only add/sub needed (t already latched).
