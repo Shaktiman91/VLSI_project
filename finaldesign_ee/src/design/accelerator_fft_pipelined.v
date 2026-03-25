@@ -165,7 +165,7 @@ module accelerator_fft_pipelined #(
           w_re      <= w_re_next;
           w_im      <= w_im_next;
         end
-        // COMPUTE now just does add/sub — t is already latched
+        // COMPUTE now just does add/sub - t is already latched
         BUTTERFLY_COMPUTE: begin
           e_re <= u_re + t_re_pipe;
           e_im <= u_im + t_im_pipe;
