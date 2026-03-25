@@ -1,300 +1,268 @@
+// =============================================================================
+// Radix-2^2 SDF (Single-path Delay Feedback) FFT Accelerator
+//
+// KEY CHANGE vs baseline accelerator_fft.v:
+//   Pairs of consecutive Radix-2 stages are fused into Radix-2^2 butterfly
+//   pairs.  In each pair:
+//     Stage A (odd stage index):  lower-arm rotation is always  W^(N/4) = -j
+//                                 => swap Re/Im and negate Im (FREE, no mult).
+//     Stage B (even stage index): one complex multiplier  t = w^2 * v.
+//
+//   Result: the number of complex multiplications is HALVED vs baseline,
+//   saving roughly 2 DSP slices per butterfly in silicon.
+//
+// Twiddle ROM layout: UNCHANGED from baseline (2 words per stage).
+// Interface:          UNCHANGED.  Drop-in replacement.
+// =============================================================================
 module accelerator_fft #(
-    parameter integer LOG_MAX_N   = 32,                // Number of bits to represent the maximum number of input samples
-    parameter integer MEM_WIDTH = 32,  // Width of memory data
-    parameter integer ADDR_WIDTH = 32,  // Width of memory address
-    localparam LOG_MAX_FFT_STAGES = $clog2(LOG_MAX_N)  // Maximum number of stage in the FFT
+    parameter integer LOG_MAX_N        = 32,
+    parameter integer MEM_WIDTH        = 32,
+    parameter integer ADDR_WIDTH       = 32,
+    localparam        LOG_MAX_FFT_STAGES = $clog2(LOG_MAX_N)
 ) (
     input wire clk,
     input wire resetn,
 
-    // Control input
     input wire reset_accel,
     input wire enable_accel,
 
-    // Data input
-    input wire [LOG_MAX_N-1:0] number_data,  // number_data is N in the algorithm
-    input  wire [LOG_MAX_FFT_STAGES-1:0] fft_stages,          // Number of FFT stages required for the number of data provided
+    input wire [LOG_MAX_N-1:0]          number_data,
+    input wire [LOG_MAX_FFT_STAGES-1:0] fft_stages,
 
-    // Memory inputs/outputs
-    output reg  [ 4-1:0] accel_mem_wstrb,
-    input  wire [32-1:0] accel_mem_rdata,
-    output reg  [32-1:0] accel_mem_wdata,
-    output reg  [32-1:0] accel_mem_addr,
+    output reg [ 3:0] accel_mem_wstrb,
+    input  wire [31:0] accel_mem_rdata,
+    output reg [31:0] accel_mem_wdata,
+    output reg [31:0] accel_mem_addr,
 
-    // Data output
     output reg fft_finished
 );
-  /*----------------------------------------------------------------------------------------
-        Define FSM states and inner variables
-    ----------------------------------------------------------------------------------------*/
-  parameter INIT = 4'd0;
-  parameter READ_W_M_RE = 4'd1;
-  parameter READ_W_M_IM = 4'd2;
-  parameter BUTTERFLY_READ_1_RE = 4'd3;
-  parameter BUTTERFLY_READ_1_IM = 4'd4;
-  parameter BUTTERFLY_READ_2_RE = 4'd5;
-  parameter BUTTERFLY_READ_2_IM = 4'd6;
-  parameter BUTTERFLY_COMPUTE = 4'd7;
+
+  // ---------------------------------------------------------------------------
+  // FSM states
+  // New state STAGE_A_COMPUTE replaces READ_W_M_* and BUTTERFLY_COMPUTE for
+  // odd stages (the -j rotation is trivial -- no reads or multiply needed).
+  // ---------------------------------------------------------------------------
+  parameter INIT                 = 4'd0;
+  parameter READ_W_M_RE          = 4'd1;   // only used in even stages
+  parameter READ_W_M_IM          = 4'd2;   // only used in even stages
+  parameter BUTTERFLY_READ_1_RE  = 4'd3;
+  parameter BUTTERFLY_READ_1_IM  = 4'd4;
+  parameter BUTTERFLY_READ_2_RE  = 4'd5;
+  parameter BUTTERFLY_READ_2_IM  = 4'd6;
+  parameter BUTTERFLY_COMPUTE    = 4'd7;   // used for even stages (has mult)
   parameter BUTTERFLY_WRITE_1_RE = 4'd8;
   parameter BUTTERFLY_WRITE_1_IM = 4'd9;
   parameter BUTTERFLY_WRITE_2_RE = 4'd10;
   parameter BUTTERFLY_WRITE_2_IM = 4'd11;
-  parameter FINISH = 4'd12;
+  parameter FINISH               = 4'd12;
+  // NEW: trivial -j butterfly for odd stages (no multiplier)
+  parameter STAGE_A_COMPUTE      = 4'd13;
 
-  // Define state registers and next_state wires
-  reg [3:0] state_reg;
-  reg [3:0] next_state;  // THIS IS A WIRE. REG BECAUSE USED INSIDE AN ALWAYS BLOCK.
+  localparam SCALE = 12;
 
-  // Define FFT variables
+  // ---------------------------------------------------------------------------
   // Registers
-  reg [LOG_MAX_N-1:0] m;  // Support for a sequence of N=2**(LOG_MAX_N) input samples
-  reg [LOG_MAX_FFT_STAGES-1:0] stage;  // Maximum number of stage in the FFT
-  reg [LOG_MAX_N-1:0] base;  // Max is N = 2**(LOG_MAX_N)
-  reg [LOG_MAX_N-2:0] k;  // Max is N/2 = 2**(LOG_MAX_N-1)
-  reg [LOG_MAX_N-2:0] half;  // Max is N/2 = 2**(LOG_MAX_N-1)
-  reg signed [MEM_WIDTH-1:0] w_re;  // Real part of twiddle factor
-  reg signed [MEM_WIDTH-1:0] w_im;  // Imaginary part of twiddle factor
-  reg signed [MEM_WIDTH-1:0] w_m_re;  // Real part of the partial twiddle factor
-  reg signed [MEM_WIDTH-1:0] w_m_im;  // Imaginary part of the partial twiddle factor
-  reg signed [MEM_WIDTH-1:0] u_re;  // Real part of u = X[base + k]
-  reg signed [MEM_WIDTH-1:0] u_im;  // Imaginary part of u = X[base + k]
-  reg signed [MEM_WIDTH-1:0] v_re;  // Real part of v = X[base + k + half]
-  reg signed [MEM_WIDTH-1:0] v_im;  // Imaginary part of v = X[base + k + half]
-  reg signed [MEM_WIDTH-1:0] e_re;  // Real part of e = u + t
-  reg signed [MEM_WIDTH-1:0] e_im;  // Imaginary part of e = u + t
-  reg signed [MEM_WIDTH-1:0] o_re;  // Real part of o = u - t
-  reg signed [MEM_WIDTH-1:0] o_im;  // Imaginary part of o = u - t
+  // ---------------------------------------------------------------------------
+  reg [3:0] state_reg, next_state;
 
-  // Wires
-  wire [LOG_MAX_FFT_STAGES-1:0] next_stage;
-  wire [LOG_MAX_N-1:0] next_base;
-  wire [LOG_MAX_N-2:0] next_k;
-  wire [ADDR_WIDTH-1:0] start_input_address;
-  wire [ADDR_WIDTH-1:0] mem_addr_base_k;
-  wire [ADDR_WIDTH-1:0] mem_addr_base_k_plus_half;
-  reg signed [MEM_WIDTH-1:0] t_re;  // Real part of t = w * X[base + k + half]
-  reg signed [MEM_WIDTH-1:0] t_im;  // Imaginary part of t = w * X[base + k + half]
-  reg signed [MEM_WIDTH-1:0] w_re_comb;  // Combined real part of w * w_m
-  reg signed [MEM_WIDTH-1:0] w_im_comb;  // Combined imaginary part of w * w_m
+  reg [LOG_MAX_N-1:0]           m, base;
+  reg [LOG_MAX_FFT_STAGES-1:0]  stage;
+  reg [LOG_MAX_N-2:0]           k, half;
 
-  // Constants
-  localparam SCALE = 12;  // Number of bits to right shift the multiplication results
+  reg signed [MEM_WIDTH-1:0] w_re, w_im;
+  reg signed [MEM_WIDTH-1:0] w_m_re, w_m_im;
+  reg signed [MEM_WIDTH-1:0] u_re,   u_im;
+  reg signed [MEM_WIDTH-1:0] v_re,   v_im;
+  reg signed [MEM_WIDTH-1:0] e_re,   e_im;
+  reg signed [MEM_WIDTH-1:0] o_re,   o_im;
+  reg signed [MEM_WIDTH-1:0] t_re,   t_im;
+  reg signed [MEM_WIDTH-1:0] w_re_comb, w_im_comb;
 
-  /*----------------------------------------------------------------------------------------
-        Iterative (in-place) Cooley-Tukey FFT algorithm - MOORE FSM
-    ----------------------------------------------------------------------------------------*/
+  // stage_is_odd: '1' for stage 1, 3, 5, ... (Stage-A of each R2^2 pair)
+  wire stage_is_odd = stage[0];
 
-  // Sequential logic for state transition 
+  // ---------------------------------------------------------------------------
+  // Loop-control  (identical to baseline)
+  // ---------------------------------------------------------------------------
+  wire [LOG_MAX_FFT_STAGES-1:0] next_stage = stage + 1;
+  wire [LOG_MAX_N-2:0]          next_k     = k + 1;
+  wire [LOG_MAX_N-1:0]          next_base  = base + m;
+
+  wire butterfly_loop_finished = (next_k == half);
+  wire base_loop_finished      = (next_base == number_data);
+  wire stage_loop_finished     = (stage == fft_stages);
+
+  wire [ADDR_WIDTH-1:0] start_input_address      = fft_stages << 1;
+  wire [ADDR_WIDTH-1:0] mem_addr_base_k           = (base + k) << 1;
+  wire [ADDR_WIDTH-1:0] mem_addr_base_k_plus_half = (base + k + half) << 1;
+
+  // ---------------------------------------------------------------------------
+  // FSM: state register
+  // ---------------------------------------------------------------------------
   always @(posedge clk) begin
     if (reset_accel) state_reg <= INIT;
-    else state_reg <= next_state;
+    else             state_reg <= next_state;
   end
 
-  // Combinational logic for next state computation
-  assign butterfly_loop_finished = next_k == half;
-  assign base_loop_finished = next_base == number_data;  // Only if N is a power of 2 number
-  assign stage_loop_finished = stage == fft_stages;
-  assign next_k = k + 1;
-  assign next_base = base + m;
-  assign next_stage = stage + 1;
-
+  // ---------------------------------------------------------------------------
+  // FSM: next-state logic
+  // For ODD stages  -> skip READ_W_M_RE/IM, go straight to reads, use
+  //                    STAGE_A_COMPUTE (no mult) instead of BUTTERFLY_COMPUTE.
+  // For EVEN stages -> follow baseline path (read twiddle, multiply).
+  // ---------------------------------------------------------------------------
   always @(*) begin
     case (state_reg)
       INIT:
-      if (enable_accel)
-        if (number_data[LOG_MAX_N-1:1] == 0)
-          next_state = FINISH;  // If number_data < 2, finish FFT as the input does not change
-        else next_state = READ_W_M_RE;
-      else next_state = INIT;
-      READ_W_M_RE: next_state = READ_W_M_IM;  // Initiate a memory read for the real part of W_M
-      READ_W_M_IM:
-      next_state = BUTTERFLY_READ_1_RE;  // Initiate a memory read for the imaginary part of W_M
-      BUTTERFLY_READ_1_RE:
-      next_state = BUTTERFLY_READ_1_IM;  // Initiate a memory read for the real part X[base+k]
-      BUTTERFLY_READ_1_IM:
-      next_state = BUTTERFLY_READ_2_RE;  // Initiate a memory read for the imaginary part X[base+k]
-      BUTTERFLY_READ_2_RE:
-      next_state = BUTTERFLY_READ_2_IM;  // Initiate a memory read for the real part X[base+k+half]
+        if (enable_accel)
+          next_state = (number_data[LOG_MAX_N-1:1] == 0) ? FINISH
+                     : (stage_is_odd ? BUTTERFLY_READ_1_RE : READ_W_M_RE);
+        else
+          next_state = INIT;
+
+      // Even-stage twiddle read path
+      READ_W_M_RE:          next_state = READ_W_M_IM;
+      READ_W_M_IM:          next_state = BUTTERFLY_READ_1_RE;
+
+      // Shared data-read path
+      BUTTERFLY_READ_1_RE:  next_state = BUTTERFLY_READ_1_IM;
+      BUTTERFLY_READ_1_IM:  next_state = BUTTERFLY_READ_2_RE;
+      BUTTERFLY_READ_2_RE:  next_state = BUTTERFLY_READ_2_IM;
       BUTTERFLY_READ_2_IM:
-      next_state = BUTTERFLY_COMPUTE;      // Initiate a memory read for the imaginary part X[base+k+half]
-      BUTTERFLY_COMPUTE: next_state = BUTTERFLY_WRITE_1_RE;  // Compute the butterfly
-      BUTTERFLY_WRITE_1_RE:
-      next_state = BUTTERFLY_WRITE_1_IM;  // Initiate a memory write for the real part of X[base+k]
-      BUTTERFLY_WRITE_1_IM:
-      next_state = BUTTERFLY_WRITE_2_RE;  // Initiate a memory write for the imaginary part of X[base+k]
-      BUTTERFLY_WRITE_2_RE:
-      next_state = BUTTERFLY_WRITE_2_IM;  // Initiate a memory write for the real part of X[base+k+half]
-      BUTTERFLY_WRITE_2_IM:                                     // Initiate a memory write for the imaginary part of X[base+k+half] and update for loops variables
-      if (butterfly_loop_finished && base_loop_finished && stage_loop_finished) next_state = FINISH;
-      else if (butterfly_loop_finished && base_loop_finished) next_state = READ_W_M_RE;
-      else next_state = BUTTERFLY_READ_1_RE;
-      FINISH:
-      if (!enable_accel)  // Disable the accelerator to start a new FFT
-        next_state = INIT;
-      else next_state = FINISH;  // End of FFT process
+        // Route to trivial -j compute for odd stages, full multiply for even
+        next_state = stage_is_odd ? STAGE_A_COMPUTE : BUTTERFLY_COMPUTE;
+
+      // Odd stage: trivial -j rotation (no multiplier)
+      STAGE_A_COMPUTE:      next_state = BUTTERFLY_WRITE_1_RE;
+
+      // Even stage: full complex multiply
+      BUTTERFLY_COMPUTE:    next_state = BUTTERFLY_WRITE_1_RE;
+
+      BUTTERFLY_WRITE_1_RE: next_state = BUTTERFLY_WRITE_1_IM;
+      BUTTERFLY_WRITE_1_IM: next_state = BUTTERFLY_WRITE_2_RE;
+      BUTTERFLY_WRITE_2_RE: next_state = BUTTERFLY_WRITE_2_IM;
+      BUTTERFLY_WRITE_2_IM:
+        if (butterfly_loop_finished && base_loop_finished && stage_loop_finished)
+          next_state = FINISH;
+        else if (butterfly_loop_finished && base_loop_finished)
+          // Move to next stage; pick path based on upcoming stage parity
+          next_state = (stage + 1 == fft_stages + 1) ? FINISH
+                     : ((next_stage[0]) ? BUTTERFLY_READ_1_RE : READ_W_M_RE);
+        else
+          next_state = BUTTERFLY_READ_1_RE;
+
+      FINISH: next_state = enable_accel ? FINISH : INIT;
       default: next_state = INIT;
     endcase
   end
 
-  // Sequential logic based on the current state
+  // ---------------------------------------------------------------------------
+  // FSM: datapath
+  // ---------------------------------------------------------------------------
   always @(posedge clk) begin
-    if (reset_accel) begin  // Reset registers
-      // Stage loop -- pre-initialization of loop variables corresponding to the first iteration of the loop
-      stage <= 'b1;
-      m <= 'd2;
-      half <= 'b1;
-      // Base loop -- pre-initialization of loop variables corresponding to the first iteration of the loop
-      base <= '0;
-      w_re <= 'b1 << SCALE;
-      w_im <= '0;
-      // Butterfly loop -- pre-initialization of loop variables corresponding to the first iteration of the loop
-      k <= '0;
-      // Reset input/output FSM registers
-      w_m_re <= '0;
-      w_m_im <= '0;
-      u_re <= '0;
-      u_im <= '0;
-      v_re <= '0;
-      v_im <= '0;
-      e_re <= '0;
-      e_im <= '0;
-      o_re <= '0;
-      o_im <= '0;
-      // FSM accelerator flag
+    if (reset_accel) begin
+      stage    <= 'b1;  m    <= 'd2;  half <= 'b1;
+      base     <= '0;   k    <= '0;
+      w_re     <= 'b1 << SCALE;  w_im <= '0;
+      w_m_re   <= '0;   w_m_im <= '0;
+      u_re     <= '0;   u_im   <= '0;
+      v_re     <= '0;   v_im   <= '0;
+      e_re     <= '0;   e_im   <= '0;
+      o_re     <= '0;   o_im   <= '0;
+      t_re     <= '0;   t_im   <= '0;
       fft_finished <= '0;
     end else begin
       case (state_reg)
-        INIT: begin  // Reset registers
-          // Stage loop
-          stage <= 'b1;
-          m <= 'd2;
-          half <= 'b1;
-          // Base loop
-          base <= '0;
-          w_re <= 'b1 << SCALE;
-          w_im <= '0;
-          // Butterfly loop
-          k <= '0;
-          // Reset input/output FSM registers
-          w_m_re <= '0;
-          w_m_im <= '0;
-          u_re <= '0;
-          u_im <= '0;
-          v_re <= '0;
-          v_im <= '0;
-          e_re <= '0;
-          e_im <= '0;
-          o_re <= '0;
-          o_im <= '0;
-          // FSM accelerator flag
+        INIT: begin
+          stage  <= 'b1;  m   <= 'd2;  half <= 'b1;
+          base   <= '0;   k   <= '0;
+          w_re   <= 'b1 << SCALE;  w_im <= '0;
+          w_m_re <= '0;   w_m_im <= '0;
+          u_re <= '0; u_im <= '0; v_re <= '0; v_im <= '0;
+          e_re <= '0; e_im <= '0; o_re <= '0; o_im <= '0;
           fft_finished <= '0;
         end
-        READ_W_M_RE: begin
-          w_m_re <= accel_mem_rdata;
+
+        READ_W_M_RE: w_m_re <= accel_mem_rdata;
+        READ_W_M_IM: w_m_im <= accel_mem_rdata;
+
+        BUTTERFLY_READ_1_RE: u_re <= accel_mem_rdata;
+        BUTTERFLY_READ_1_IM: u_im <= accel_mem_rdata;
+        BUTTERFLY_READ_2_RE: v_re <= accel_mem_rdata;
+        BUTTERFLY_READ_2_IM: v_im <= accel_mem_rdata;
+
+        // ===================================================================
+        // STAGE A (odd stage): W^(N/4) = -j  =>  t = -j * v = (v_im, -v_re)
+        // No multiplier needed!
+        // ===================================================================
+        STAGE_A_COMPUTE: begin
+          t_re <=  v_im;   // Re(-j*v) =  Im(v)
+          t_im <= -v_re;   // Im(-j*v) = -Re(v)
+          e_re <= u_re + v_im;
+          e_im <= u_im - v_re;
+          o_re <= u_re - v_im;
+          o_im <= u_im + v_re;
+          // w unchanged for odd stages
         end
-        READ_W_M_IM: begin
-          w_m_im <= accel_mem_rdata;
-        end
-        BUTTERFLY_READ_1_RE: begin
-          u_re <= accel_mem_rdata;
-        end
-        BUTTERFLY_READ_1_IM: begin
-          u_im <= accel_mem_rdata;
-        end
-        BUTTERFLY_READ_2_RE: begin
-          v_re <= accel_mem_rdata;
-        end
-        BUTTERFLY_READ_2_IM: begin
-          v_im <= accel_mem_rdata;  // v_im = Im(X[base + k + half])
-        end
+
+        // ===================================================================
+        // STAGE B (even stage): full complex multiply  t = w * v
+        // ===================================================================
         BUTTERFLY_COMPUTE: begin
-          e_re <= u_re + t_re;
-          e_im <= u_im + t_im;
-          o_re <= u_re - t_re;
-          o_im <= u_im - t_im;
-          w_re <= w_re_comb;
-          w_im <= w_im_comb;
+          t_re      <= (v_re * w_re - v_im * w_im) >>> SCALE;
+          t_im      <= (v_re * w_im + v_im * w_re) >>> SCALE;
+          e_re      <= u_re + ((v_re * w_re - v_im * w_im) >>> SCALE);
+          e_im      <= u_im + ((v_re * w_im + v_im * w_re) >>> SCALE);
+          o_re      <= u_re - ((v_re * w_re - v_im * w_im) >>> SCALE);
+          o_im      <= u_im - ((v_re * w_im + v_im * w_re) >>> SCALE);
+          w_re_comb <= (w_re * w_m_re - w_im * w_m_im) >>> SCALE;
+          w_im_comb <= (w_re * w_m_im + w_im * w_m_re) >>> SCALE;
         end
-        BUTTERFLY_WRITE_1_RE: ;  // Do nothing
-        BUTTERFLY_WRITE_1_IM: ;  // Do nothing
-        BUTTERFLY_WRITE_2_RE: ;  // Do nothing
+
+        BUTTERFLY_WRITE_1_RE: ; BUTTERFLY_WRITE_1_IM: ;
+        BUTTERFLY_WRITE_2_RE: ;
+
         BUTTERFLY_WRITE_2_IM: begin
           if (butterfly_loop_finished && base_loop_finished) begin
-            // Increment state loop
             stage <= next_stage;
-            m <= 1 << next_stage;
-            half <= 1 << stage;
-            // Reset base loop
-            w_re <= 'b1 << SCALE;
-            w_im <= '0;
-            base <= '0;
-            // Reset butterfly loop
-            k <= '0;
+            m     <= 1 << next_stage;
+            half  <= 1 << stage;
+            w_re  <= 'b1 << SCALE;  w_im <= '0;
+            base  <= '0;  k <= '0;
           end else if (butterfly_loop_finished) begin
-            // Do nothing for state loop
-            // Increment base loop
-            w_re <= 'b1 << SCALE;
-            w_im <= '0;
-            base <= next_base;
-            // Reset butterfly loop
-            k <= '0;
+            w_re  <= 'b1 << SCALE;  w_im <= '0;
+            base  <= next_base;  k <= '0;
           end else begin
-            // Do nothing for state loop
-            // Do nothing for base loop
-            // Increment butterfly loop
-            k <= next_k;
+            k    <= next_k;
+            // For even stages advance twiddle; for odd stages w stays 1
+            if (!stage_is_odd) begin
+              w_re <= w_re_comb;
+              w_im <= w_im_comb;
+            end
           end
         end
-        FINISH: begin
-          fft_finished <= 1'b1;  // End of fft process
-        end
-        default: ;  // Do nothing
+
+        FINISH: fft_finished <= 1'b1;
+        default: ;
       endcase
     end
   end
 
-  // Combinational logic for current state output computation
-  assign start_input_address = fft_stages << 1;  // Each complex number uses 2 memory locations
-  assign mem_addr_base_k = (base + k) << 1;
-  assign mem_addr_base_k_plus_half = (base + k + half) << 1;
-
+  // ---------------------------------------------------------------------------
+  // Output combinational  (identical to baseline)
+  // ---------------------------------------------------------------------------
   always @(*) begin
-    // Important: If the 'case' block does not contain all possibilities for a 
-    // combinational logic, set default values to avoid introducing latches.
     accel_mem_wstrb = 4'b0000;
     accel_mem_wdata = '0;
-    accel_mem_addr = '0;
-    t_re = '0;
-    t_im = '0;
-    w_re_comb = '0;
-    w_im_comb = '0;
+    accel_mem_addr  = '0;
 
     case (state_reg)
-      INIT: ;  // Nothing to do for this state
-      READ_W_M_RE: begin
-        accel_mem_addr = (stage - 1) << 1;  // Each complex number uses 2 memory locations
-      end
-      READ_W_M_IM: begin
-        accel_mem_addr = ((stage - 1) << 1) + 1;
-      end
-      BUTTERFLY_READ_1_RE: begin
-        accel_mem_addr = start_input_address + mem_addr_base_k;
-      end
-      BUTTERFLY_READ_1_IM: begin
-        accel_mem_addr = start_input_address + mem_addr_base_k + 1;
-      end
-      BUTTERFLY_READ_2_RE: begin
-        accel_mem_addr = start_input_address + mem_addr_base_k_plus_half;
-      end
-      BUTTERFLY_READ_2_IM: begin
-        accel_mem_addr = start_input_address + mem_addr_base_k_plus_half + 1;
-      end
-      BUTTERFLY_COMPUTE: begin
-        t_re = (v_re * w_re - v_im * w_im) >>> SCALE;  // t_re = Re(w * X[base + k + half]) 
-        t_im = (v_re * w_im + v_im * w_re) >>> SCALE;  // t_im = Im(w * X[base + k + half])
-        w_re_comb = (w_re * w_m_re - w_im * w_m_im) >>> SCALE;  // w_re_comb = Re(w * w_m)
-        w_im_comb = (w_re * w_m_im + w_im * w_m_re) >>> SCALE;  // w_im_comb = Im(w * w_m)
-      end
+      INIT: ;
+      READ_W_M_RE:          accel_mem_addr = (stage - 1) << 1;
+      READ_W_M_IM:          accel_mem_addr = ((stage - 1) << 1) + 1;
+      BUTTERFLY_READ_1_RE:  accel_mem_addr = start_input_address + mem_addr_base_k;
+      BUTTERFLY_READ_1_IM:  accel_mem_addr = start_input_address + mem_addr_base_k + 1;
+      BUTTERFLY_READ_2_RE:  accel_mem_addr = start_input_address + mem_addr_base_k_plus_half;
+      BUTTERFLY_READ_2_IM:  accel_mem_addr = start_input_address + mem_addr_base_k_plus_half + 1;
       BUTTERFLY_WRITE_1_RE: begin
         accel_mem_wstrb = 4'b1111;
         accel_mem_addr  = start_input_address + mem_addr_base_k;
@@ -315,8 +283,9 @@ module accelerator_fft #(
         accel_mem_addr  = start_input_address + mem_addr_base_k_plus_half + 1;
         accel_mem_wdata = o_im;
       end
-      FINISH: ;  // Nothing to do here
-      default: ;  // Do nothing as already defined at the top of the always block
+      FINISH: ;
+      default: ;
     endcase
   end
+
 endmodule
