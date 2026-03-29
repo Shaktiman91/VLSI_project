@@ -1,4 +1,3 @@
-
 ##########################################################################
 ###
 ### Synthesis scripts - export.
@@ -48,6 +47,28 @@ report nets -cap_worst 50 -hierarchical   > ${REPORTS_PATH}/${IMPL_STAGE}/${DESI
 
 
 ####################################################################
+## Power reports
+####################################################################
+
+# 1. Static power report (internal switching activity estimate, always available)
+report power -hierarchy                   > ${REPORTS_PATH}/${IMPL_STAGE}/${DESIGN}_power_static.rpt
+
+# 2. VCD-annotated power report (most accurate - uses physical simulation activity)
+#    Uses the hold-corner VCD written by sim_phys/scripts/run_vcd_hold.cmd
+set VCD_FILE "../sim_phys/vcd/${DESIGN}.phys.hold.vcd"
+if {[file exists ${VCD_FILE}]} {
+  puts "\nAnnotating switching activity from VCD: ${VCD_FILE}"
+  read_activity_file -format VCD -scope /testbench/dut ${VCD_FILE}
+  report power -hierarchy                 > ${REPORTS_PATH}/${IMPL_STAGE}/${DESIGN}_power_vcd.rpt
+  puts "VCD-annotated power report written to ${REPORTS_PATH}/${IMPL_STAGE}/${DESIGN}_power_vcd.rpt"
+} else {
+  puts "\nINFO: VCD file not found at ${VCD_FILE}"
+  puts "      Run sim_phys first to generate the VCD, then re-run synthesis export"
+  puts "      for an activity-annotated power report."
+}
+
+
+####################################################################
 ## Generate output files for structural simulation and PnR
 ####################################################################
 
@@ -57,4 +78,4 @@ write_encounter *
 write_hdl ${DESIGN} > ${OUTPUTS_PATH}/${DESIGN}.struct.v
 write_sdc ${DESIGN} > ${OUTPUTS_PATH}/${DESIGN}.struct.sdc
 
-write_sdf -nonegchecks -interconn "interconnect" -delimiter "/" > ${OUTPUTS_PATH}/${DESIGN}.struct.sdf 
+write_sdf -nonegchecks -interconn "interconnect" -delimiter "/" > ${OUTPUTS_PATH}/${DESIGN}.struct.sdf
